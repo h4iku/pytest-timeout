@@ -26,6 +26,7 @@ if HAVE_SIGALRM:
     DEFAULT_METHOD = "signal"
 else:
     DEFAULT_METHOD = "thread"
+DEFAULT_SIGNAL_TIMER = "ITIMER_REAL"
 TIMEOUT_DESC = """
 Timeout in seconds before dumping the stacks.  Default is 0 which
 means no timeout.
@@ -40,11 +41,19 @@ When set to True, defers the timeout evaluation to only the test
 function body, ignoring the time it takes when evaluating any fixtures
 used in the test.
 """.strip()
+SIGNAL_TIMER_DESC = """
+Timeout timer to use, only when the timeout mechanism is set to 'signal'.
+If unspecified, the timer will be ITIMER_REAL, meaning that the timeout
+will be based on wall-clock time.  Other options include ITIMER_VIRTUAL,
+in which the timer uses the user CPU time of the process, and ITIMER_PROF,
+in which the timer uses the user and system CPU time of the process.
+""".strip()
 
 # bdb covers pdb, ipdb, and possibly others
 # pydevd covers PyCharm, VSCode, and possibly others
 KNOWN_DEBUGGING_MODULES = {"pydevd", "bdb", "pydevd_frame_evaluator"}
-Settings = namedtuple("Settings", ["timeout", "method", "func_only"])
+Settings = namedtuple("Settings", ["timeout", "method", "func_only", "signal_timer"])
+
 
 
 @pytest.hookimpl
@@ -68,9 +77,17 @@ def pytest_addoption(parser):
         choices=["signal", "thread"],
         help=METHOD_DESC,
     )
+    group.addoption(
+        "--timeout-signal-timer",
+        dest="timeout_signal_timer",
+        action="store",
+        choices=["ITIMER_REAL", "ITIMER_VIRTUAL", "ITIMER_PROF"],
+        help=SIGNAL_TIMER_DESC
+    )
     parser.addini("timeout", TIMEOUT_DESC)
     parser.addini("timeout_method", METHOD_DESC)
     parser.addini("timeout_func_only", FUNC_ONLY_DESC, type="bool")
+    parser.addini("timeout_signal_timer", SIGNAL_TIMER_DESC)
 
 
 class TimeoutHooks:
@@ -107,19 +124,23 @@ def pytest_configure(config):
     """Register the marker so it shows up in --markers output."""
     config.addinivalue_line(
         "markers",
-        "timeout(timeout, method=None, func_only=False): Set a timeout, timeout "
+        "timeout(timeout, method=None, func_only=False, signal_timer=\"ITIMER_REAL\"): " 
+        "Set a timeout, timeout "
         "method and func_only evaluation on just one test item.  The first "
         "argument, *timeout*, is the timeout in seconds while the keyword, "
         "*method*, takes the same values as the --timeout_method option. The "
         "*func_only* keyword, when set to True, defers the timeout evaluation "
         "to only the test function body, ignoring the time it takes when "
-        "evaluating any fixtures used in the test.",
+        "evaluating any fixtures used in the test."
+        "The *signal_timer* keyword determines the timer used when *method* is signal."
+        ,
     )
 
     settings = get_env_settings(config)
     config._env_timeout = settings.timeout
     config._env_timeout_method = settings.method
     config._env_timeout_func_only = settings.func_only
+    config._env_timeout_signal_timer = settings.signal_timer
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -162,11 +183,12 @@ def pytest_report_header(config):
     """Add timeout config to pytest header."""
     if config._env_timeout:
         return [
-            "timeout: %ss\ntimeout method: %s\ntimeout func_only: %s"
+            "timeout: %ss\ntimeout method: %s\ntimeout func_only: %s\ntimeout signal_timer: %s"
             % (
                 config._env_timeout,
                 config._env_timeout_method,
                 config._env_timeout_func_only,
+                config._env_timeout_signal_timer
             )
         ]
 
@@ -235,18 +257,32 @@ def pytest_timeout_set_timer(item, settings):
         timeout_method = "thread"
 
     if timeout_method == "signal":
+        if settings.timeout is None or settings.timeout <= 0:
+            return
+        if settings.method == "signal":
+            if settings.signal_timer == "ITIMER_REAL":
+                timer = signal.ITIMER_REAL
+                sig = signal.SIGALRM
+            elif settings.signal_timer == "ITIMER_VIRTUAL":
+                timer = signal.ITIMER_VIRTUAL
+                sig = signal.SIGVTALRM
+            elif settings.signal_timer == "ITIMER_PROF":
+                timer = signal.ITIMER_PROF
+                sig = signal.SIGPROF
+            else:
+                raise ValueError("Unknown timer type %s" % (settings.signal_timer))
 
         def handler(signum, frame):
             __tracebackhide__ = True
             timeout_sigalrm(item, settings.timeout)
 
         def cancel():
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            signal.setitimer(timer, 0)
+            signal.signal(sig, signal.SIG_DFL)
 
         item.cancel_timeout = cancel
-        signal.signal(signal.SIGALRM, handler)
-        signal.setitimer(signal.ITIMER_REAL, settings.timeout)
+        signal.signal(sig, handler)
+        signal.setitimer(timer, settings.timeout)
     elif timeout_method == "thread":
         timer = threading.Timer(
             settings.timeout, timeout_timer, (item, settings.timeout)
@@ -304,12 +340,21 @@ def get_env_settings(config):
         func_only = None
     if func_only is not None:
         func_only = _validate_func_only(func_only, "config file")
-    return Settings(timeout, method, func_only or False)
+
+    signal_timer = config.getvalue("timeout_signal_timer")
+    if signal_timer is None:
+        signal_timer = config.getini("timeout_signal_timer")
+    if signal_timer is None or signal_timer == "":
+        signal_timer = DEFAULT_SIGNAL_TIMER
+    if signal_timer is not None:
+        signal_timer = _validate_signal_timer(signal_timer, "config_file")
+
+    return Settings(timeout, method, func_only or False, signal_timer)
 
 
 def _get_item_settings(item, marker=None):
     """Return (timeout, method) for an item."""
-    timeout = method = func_only = None
+    timeout = method = func_only = signal_timer = None
     if not marker:
         marker = item.get_closest_marker("timeout")
     if marker is not None:
@@ -317,6 +362,7 @@ def _get_item_settings(item, marker=None):
         timeout = _validate_timeout(settings.timeout, "marker")
         method = _validate_method(settings.method, "marker")
         func_only = _validate_func_only(settings.func_only, "marker")
+        signal_timer = _validate_signal_timer(settings.signal_timer, "marker")
     if timeout is None:
         timeout = item.config._env_timeout
     if method is None:
@@ -325,7 +371,9 @@ def _get_item_settings(item, marker=None):
         func_only = item.config._env_timeout_func_only
     if func_only is None:
         func_only = False
-    return Settings(timeout, method, func_only)
+    if signal_timer is None:
+        signal_timer = item.config._env_timeout_signal_timer
+    return Settings(timeout, method, func_only, signal_timer)
 
 
 def _parse_marker(marker):
@@ -336,7 +384,7 @@ def _parse_marker(marker):
     """
     if not marker.args and not marker.kwargs:
         raise TypeError("Timeout marker must have at least one argument")
-    timeout = method = func_only = NOTSET = object()
+    timeout = method = func_only = signal_timer = NOTSET = object()
     for kw, val in marker.kwargs.items():
         if kw == "timeout":
             timeout = val
@@ -344,6 +392,8 @@ def _parse_marker(marker):
             method = val
         elif kw == "func_only":
             func_only = val
+        elif kw == "signal_timer":
+            signal_timer = val
         else:
             raise TypeError("Invalid keyword argument for timeout marker: %s" % kw)
     if len(marker.args) >= 1 and timeout is not NOTSET:
@@ -362,7 +412,9 @@ def _parse_marker(marker):
         method = None
     if func_only is NOTSET:
         func_only = None
-    return Settings(timeout, method, func_only)
+    if signal_timer is NOTSET:
+        signal_timer = None
+    return Settings(timeout, method, func_only, signal_timer)
 
 
 def _validate_timeout(timeout, where):
@@ -389,6 +441,12 @@ def _validate_func_only(func_only, where):
         raise ValueError("Invalid func_only value %s from %s" % (func_only, where))
     return func_only
 
+def _validate_signal_timer(signal_timer, where):
+    if signal_timer is None:
+        return None
+    if signal_timer not in ["ITIMER_REAL", "ITIMER_VIRTUAL", "ITIMER_PROF"]:
+        raise ValueError("Invalid signal_timer %s from %s" % (signal_timer, where))
+    return signal_timer
 
 def timeout_sigalrm(item, timeout):
     """Dump stack of threads and raise an exception.
